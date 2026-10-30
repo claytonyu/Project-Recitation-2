@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Airway RNA-seq Demo</title>
+<style>
+  :root { --bg:#fff; --fg:#1c2430; --muted:#667085; --line:#e4e7ec; --card:#f8f9fb; --up:#d92d20; --down:#2e6bd6; --ns:#b8bec9; --acc:#0b6e4f; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#12161c; --fg:#e8ebf0; --muted:#98a2b3; --line:#2a313c; --card:#1a2029; --up:#f97066; --down:#6b9cf5; --ns:#4a5260; --acc:#4cc9a0; } }
+  * { box-sizing:border-box }
+  body { margin:0; padding:20px 16px 48px; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,sans-serif; max-width:1100px; margin-inline:auto }
+  h1 { font-size:22px; margin:0 0 4px } h2 { font-size:16px; margin:0 0 8px }
+  p.sub { color:var(--muted); margin:0 0 16px }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px } @media (max-width:800px){ .grid{grid-template-columns:1fr} }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px }
+  .ctl { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:12px; font-size:14px }
+  input[type=text], input[type=number] { padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); font:inherit }
+  input[type=number] { width:80px }
+  canvas { width:100%; display:block }
+  table { width:100%; border-collapse:collapse; font-size:13px }
+  th, td { padding:5px 6px; text-align:right; border-bottom:1px solid var(--line) } th:first-child, td:first-child { text-align:left }
+  th { cursor:pointer; color:var(--muted); font-weight:600; user-select:none } tbody tr { cursor:pointer } tbody tr:hover, tr.sel { background:var(--line) }
+  .note { font-size:12.5px; color:var(--muted); margin-top:16px }
+  #tip { position:fixed; pointer-events:none; background:var(--fg); color:var(--bg); padding:3px 7px; border-radius:5px; font-size:12px; display:none }
+  .scroll { max-height:340px; overflow:auto }
+</style>
+</head>
+<body>
+<h1>Airway RNA-seq: dexamethasone effect</h1>
+<p class="sub">Human airway smooth muscle cells, 4 cell lines, each treated vs untreated with dexamethasone (Himes et al. 2014, Bioconductor <i>airway</i>).</p>
+
+<div class="card" style="margin-bottom:16px">
+  <div class="ctl">
+    <label>adj. p &lt; <input type="number" id="qcut" value="0.05" step="0.01" min="0" max="1"></label>
+    <label>|log2FC| &gt; <input type="number" id="fcut" value="1" step="0.25" min="0"></label>
+    <input type="text" id="search" placeholder="Search gene ID or symbol…">
+    <span id="summary" style="color:var(--muted)"></span>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card"><h2>Volcano plot</h2><canvas id="volcano" height="360"></canvas></div>
+  <div class="card"><h2 id="gtitle">Gene counts</h2><canvas id="genec" height="360"></canvas></div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>Genes</h2>
+  <div class="scroll"><table><thead><tr>
+    <th data-k="id">Gene</th><th data-k="bm">Mean count</th><th data-k="lfc">log2FC</th><th data-k="p">p</th><th data-k="q">adj. p</th>
+  </tr></thead><tbody id="rows"></tbody></table></div>
+</div>
+
+<p class="note">Counts are the real airway dataset (63,677 genes, 8 samples; genes with fewer than 10 total reads removed). The statistics here are a simplified stand-in for DESeq2: median-of-ratios normalization, then a paired t-test on log2(count+1) across the 4 cell lines with Benjamini-Hochberg correction. Use DESeq2 for real analysis. Only a few well-known genes have symbols shown.</p>
+<div id="tip"></div>
+<script src="airway-demo/data.js"></script>
+<script>
+const D = window.AIRWAY, G = D.genes;
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+let sel = null, sortK = 'q', sortDir = 1, shown = [];
+const label = g => g.sym ? `${g.sym} (${g.id})` : g.id;
+const fmt = v => v < 0.001 && v > 0 ? v.toExponential(1) : (+v.toPrecision(3)).toString();
+
+function cls(g) {
+  const q = +$('qcut').value, f = +$('fcut').value;
+  if (g.q < q && Math.abs(g.lfc) > f) return g.lfc > 0 ? 'up' : 'down';
+  return 'ns';
+}
+function setup(c) {
+  const r = devicePixelRatio || 1, w = c.clientWidth, h = +c.getAttribute('height');
+  c.width = w * r; c.height = h * r; const x = c.getContext('2d'); x.scale(r, r); return [x, w, h];
+}
+let vmap = null;
+function volcano() {
+  const c = $('volcano'), [x, w, h] = setup(c), m = {l:46, r:10, t:10, b:36};
+  const nl = g => -Math.log10(Math.max(g.p, 1e-300));
+  const xs = Math.max(2, ...G.map(g => Math.abs(g.lfc))) * 1.05, ys = Math.max(...G.map(nl)) * 1.05;
+  const X = v => m.l + (v + xs) / (2 * xs) * (w - m.l - m.r), Y = v => h - m.b - v / ys * (h - m.t - m.b);
+  vmap = {X, Y, nl};
+  x.clearRect(0, 0, w, h); x.font = '11px system-ui'; x.fillStyle = css('--muted'); x.strokeStyle = css('--line');
+  for (let t = Math.ceil(-xs); t <= xs; t += 2) { x.fillText(t, X(t) - 4, h - m.b + 14); x.beginPath(); x.moveTo(X(t), m.t); x.lineTo(X(t), h - m.b); x.stroke(); }
+  for (let t = 0; t <= ys; t += 10) { x.fillText(t, 8, Y(t) + 4); x.beginPath(); x.moveTo(m.l, Y(t)); x.lineTo(w - m.r, Y(t)); x.stroke(); }
+  x.fillText('log2 fold change (treated / untreated)', w / 2 - 80, h - 6);
+  x.save(); x.translate(12, h / 2 + 30); x.rotate(-Math.PI / 2); x.fillText('-log10 p', 0, 0); x.restore();
+  const col = {up:css('--up'), down:css('--down'), ns:css('--ns')};
+  for (const k of ['ns', 'down', 'up']) {
+    x.fillStyle = col[k]; x.globalAlpha = k === 'ns' ? 0.4 : 0.8; x.beginPath();
+    for (const g of G) if (cls(g) === k) { const px = X(g.lfc), py = Y(nl(g)); x.moveTo(px + 2, py); x.arc(px, py, 2, 0, 7); }
+    x.fill();
+  }
+  x.globalAlpha = 1;
+  if (sel) { x.strokeStyle = css('--fg'); x.lineWidth = 2; x.beginPath(); x.arc(X(sel.lfc), Y(nl(sel)), 6, 0, 7); x.stroke(); x.lineWidth = 1; }
+}
+function geneChart() {
+  const c = $('genec'), [x, w, h] = setup(c); x.clearRect(0, 0, w, h);
+  if (!sel) { x.fillStyle = css('--muted'); x.font = '14px system-ui'; x.fillText('Click a gene in the table or a point on the volcano plot', 20, h / 2); $('gtitle').textContent = 'Gene counts'; return; }
+  $('gtitle').textContent = `${label(sel)}: normalized counts`;
+  const m = {l:50, r:10, t:14, b:48}, mx = Math.max(...sel.c, 1) * 1.1, n = sel.c.length, bw = (w - m.l - m.r) / n;
+  const Y = v => h - m.b - v / mx * (h - m.t - m.b);
+  x.font = '11px system-ui'; x.strokeStyle = css('--line'); x.fillStyle = css('--muted');
+  for (let i = 0; i <= 4; i++) { const v = mx * i / 4; x.beginPath(); x.moveTo(m.l, Y(v)); x.lineTo(w - m.r, Y(v)); x.stroke(); x.fillText(Math.round(v), 6, Y(v) + 4); }
+  sel.c.forEach((v, i) => {
+    x.fillStyle = D.dex[i] === 'trt' ? css('--up') : css('--down');
+    x.fillRect(m.l + i * bw + bw * 0.15, Y(v), bw * 0.7, h - m.b - Y(v));
+    x.fillStyle = css('--muted'); x.fillText(D.cell[i], m.l + i * bw + bw * 0.15, h - m.b + 14); x.fillText(D.dex[i], m.l + i * bw + bw * 0.15, h - m.b + 28);
+  });
+}
+function table() {
+  const s = $('search').value.trim().toLowerCase();
+  shown = G.filter(g => !s || g.id.toLowerCase().includes(s) || (g.sym && g.sym.toLowerCase().includes(s)));
+  shown.sort((a, b) => sortK === 'id' ? sortDir * a.id.localeCompare(b.id) : sortDir * (a[sortK] - b[sortK]));
+  $('rows').innerHTML = shown.slice(0, 200).map((g, i) =>
+    `<tr data-i="${i}" class="${g === sel ? 'sel' : ''}"><td>${label(g)}</td><td>${g.bm}</td><td>${g.lfc}</td><td>${fmt(g.p)}</td><td>${fmt(g.q)}</td></tr>`).join('');
+  const n = {up:0, down:0}; G.forEach(g => { const k = cls(g); if (k !== 'ns') n[k]++; });
+  $('summary').textContent = `${G.length.toLocaleString()} genes · ${n.up} up, ${n.down} down`;
+}
+function draw() { table(); volcano(); geneChart(); }
+function select(g) { sel = g; draw(); }
+
+$('rows').onclick = e => { const tr = e.target.closest('tr'); if (tr) select(shown[+tr.dataset.i]); };
+document.querySelectorAll('th').forEach(th => th.onclick = () => {
+  const k = th.dataset.k; sortDir = sortK === k ? -sortDir : (k === 'bm' ? -1 : 1); sortK = k; table();
+});
+['qcut', 'fcut'].forEach(id => $(id).oninput = () => { table(); volcano(); });
+$('search').oninput = table;
+function nearest(e) {
+  const r = $('volcano').getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top; let best = null, bd = 100;
+  for (const g of G) { const d = (vmap.X(g.lfc) - mx) ** 2 + (vmap.Y(vmap.nl(g)) - my) ** 2; if (d < bd) { bd = d; best = g; } }
+  return best;
+}
+$('volcano').onmousemove = e => { const g = nearest(e), t = $('tip'); if (g) { t.style.display = 'block'; t.style.left = e.clientX + 12 + 'px'; t.style.top = e.clientY + 12 + 'px'; t.textContent = `${label(g)}  log2FC ${g.lfc}`; } else t.style.display = 'none'; };
+$('volcano').onmouseleave = () => $('tip').style.display = 'none';
+$('volcano').onclick = e => { const g = nearest(e); if (g) select(g); };
+addEventListener('resize', () => { volcano(); geneChart(); });
+select(G.slice().sort((a, b) => a.q - b.q)[0]);
+</script>
+</body>
+</html>
